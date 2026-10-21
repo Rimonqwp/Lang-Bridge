@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "prod": "langbridge-presenter-client"
+  },
+  "targets": {},
+  "etags": {}
+}

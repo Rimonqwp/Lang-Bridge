@@ -1,0 +1,415 @@
+swagger: "2.0"
+info:
+  title: LangBridge API
+  description: API for LangBridge chat functions
+  version: "1.0.0"
+schemes:
+  - https
+produces:
+  - application/json
+paths:
+  /api/talk:
+    post:
+      summary: Talk stream endpoint
+      operationId: talkStream
+      x-google-backend:
+        address: ${TALK_STREAM}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              askText:
+                type: string
+              sessionId:
+                type: string
+              traceId:
+                type: string
+              extra:
+                type: object
+      responses:
+        200:
+          description: Successful response
+  /api/welcome:
+    post:
+      summary: Welcome message endpoint
+      operationId: welcome
+      x-google-backend:
+        address: ${WELCOME}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              traceId:
+                type: string
+              sessionId:
+                type: string
+              languageCode:
+                type: string
+      responses:
+        200:
+          description: Successful response
+  /api/goodbye:
+    post:
+      summary: Goodbye message endpoint
+      operationId: goodbye
+      x-google-backend:
+        address: ${GOODBYE}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              traceId:
+                type: string
+              sessionId:
+                type: string
+              languageCode:
+                type: string
+      responses:
+        200:
+          description: Successful response
+  /api/recquestions:
+    post:
+      summary: Recommended questions endpoint
+      operationId: recquestions
+      x-google-backend:
+        address: ${RECQUESTIONS}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              traceId:
+                type: string
+              languageCode:
+                type: string
+      responses:
+        200:
+          description: Successful response
+  /api/speech:
+    post:
+      summary: Speech message endpoint
+      operationId: speech
+      x-google-backend:
+        address: ${SPEECH}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              traceId:
+                type: string
+              sessionId:
+                type: string
+              languageCode:
+                type: string
+      responses:
+        200:
+          description: Successful response
+  /api/config:
+    post:
+      summary: Configuration endpoint
+      operationId: config
+      security:
+        - api_key: []
+      x-google-backend:
+        address: ${CONFIG}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              welcome_messages:
+                type: object
+              goodbye_messages:
+                type: object
+              recommended_questions:
+                type: object
+      responses:
+        200:
+          description: Successful response
+  /api/voice-chat:
+    options:
+      summary: Voice chat preflight
+      operationId: voiceChatOptions
+      x-google-backend:
+        address: ${VOICE_CHAT}
+      responses:
+        204:
+          description: CORS preflight response
+    post:
+      summary: Voice assistant text/audio command fallback
+      operationId: voiceChatPost
+      x-google-backend:
+        address: ${VOICE_CHAT}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              question:
+                type: string
+              lease_session_id:
+                type: string
+              courseId:
+                type: string
+              presentationId:
+                type: string
+              slideId:
+                type: string
+              languageCode:
+                type: string
+      responses:
+        200:
+          description: Successful response
+  /api/voice-chat-admin:
+    options:
+      summary: Voice chat admin preflight
+      operationId: voiceChatAdminOptions
+      x-google-backend:
+        address: ${VOICE_CHAT_ADMIN}
+      responses:
+        204:
+          description: CORS preflight response
+    get:
+      summary: Voice chat admin dashboard data
+      operationId: voiceChatAdminGet
+      x-google-backend:
+        address: ${VOICE_CHAT_ADMIN}
+      responses:
+        200:
+          description: Successful response
+    post:
+      summary: Voice chat admin limits update
+      operationId: voiceChatAdminPost
+      x-google-backend:
+        address: ${VOICE_CHAT_ADMIN}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              requests_per_minute:
+                type: integer
+              requests_per_day:
+                type: integer
+      responses:
+        200:
+          description: Successful response
+  /api/admin-teachers:
+    options:
+      summary: Admin teachers preflight
+      operationId: adminTeachersOptions
+      x-google-backend:
+        address: ${ADMIN_TEACHERS}
+      responses:
+        204:
+          description: CORS preflight response
+    get:
+      summary: List teacher accounts
+      operationId: adminTeachersGet
+      x-google-backend:
+        address: ${ADMIN_TEACHERS}
+      responses:
+        200:
+          description: Successful response
+    post:
+      summary: Grant or revoke teacher role
+      operationId: adminTeachersPost
+      x-google-backend:
+        address: ${ADMIN_TEACHERS}
+      responses:
+        200:
+          description: Successful response
+  /api/teacher-courses:
+    options:
+      summary: Teacher courses preflight
+      operationId: teacherCoursesOptions
+      x-google-backend:
+        address: ${TEACHER_COURSES}
+      responses:
+        204:
+          description: CORS preflight response
+    get:
+      summary: List teacher-owned courses and classes
+      operationId: teacherCoursesGet
+      x-google-backend:
+        address: ${TEACHER_COURSES}
+      responses:
+        200:
+          description: Successful response
+    post:
+      summary: Create/update courses, clone classes, manage class students
+      operationId: teacherCoursesPost
+      x-google-backend:
+        address: ${TEACHER_COURSES}
+      responses:
+        200:
+          description: Successful response
+  /api/student-courses:
+    options:
+      summary: Student courses preflight
+      operationId: studentCoursesOptions
+      x-google-backend:
+        address: ${STUDENT_COURSES}
+      responses:
+        204:
+          description: CORS preflight response
+    get:
+      summary: List selectable student classes and role flags
+      operationId: studentCoursesGet
+      x-google-backend:
+        address: ${STUDENT_COURSES}
+      responses:
+        200:
+          description: Successful response
+    post:
+      summary: Enroll/select class or fetch current view pointer
+      operationId: studentCoursesPost
+      x-google-backend:
+        address: ${STUDENT_COURSES}
+      responses:
+        200:
+          description: Successful response
+  /api/teacher-student-records:
+    options:
+      summary: Voice teacher records preflight
+      operationId: voiceTeacherRecordsOptions
+      x-google-backend:
+        address: ${TEACHER_STUDENT_RECORDS}
+      responses:
+        204:
+          description: CORS preflight response
+    get:
+      summary: Teacher-facing voice usage records and user settings
+      operationId: voiceTeacherRecordsGet
+      x-google-backend:
+        address: ${TEACHER_STUDENT_RECORDS}
+      responses:
+        200:
+          description: Successful response
+  /api/voice-chat-access:
+    options:
+      summary: Voice chat access preflight
+      operationId: voiceChatAccessOptions
+      x-google-backend:
+        address: ${VOICE_CHAT_ACCESS}
+      responses:
+        204:
+          description: CORS preflight response
+    get:
+      summary: Voice chat access check
+      operationId: voiceChatAccessGet
+      x-google-backend:
+        address: ${VOICE_CHAT_ACCESS}
+      responses:
+        200:
+          description: Successful response
+  /api/text-chat-access:
+    options:
+      summary: Text chat access preflight
+      operationId: textChatAccessOptions
+      x-google-backend:
+        address: ${TEXT_CHAT_ACCESS}
+      responses:
+        204:
+          description: CORS preflight response
+    get:
+      summary: Text chat access check
+      operationId: textChatAccessGet
+      x-google-backend:
+        address: ${TEXT_CHAT_ACCESS}
+      responses:
+        200:
+          description: Successful response
+  /api/tutor-ask:
+    options:
+      summary: Tutor ask preflight
+      operationId: tutorAskOptions
+      x-google-backend:
+        address: ${TUTOR_ASK}
+      responses:
+        204:
+          description: CORS preflight response
+    post:
+      summary: Tutor text Q&A with grounded Gemini + TTS
+      operationId: tutorAskPost
+      x-google-backend:
+        address: ${TUTOR_ASK}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              question:
+                type: string
+              courseId:
+                type: string
+              presentationId:
+                type: string
+              slideId:
+                type: string
+              languageCode:
+                type: string
+      responses:
+        200:
+          description: Successful response
+  /api/voice-live-session:
+    options:
+      summary: Voice live session preflight
+      operationId: voiceLiveSessionOptions
+      x-google-backend:
+        address: ${VOICE_LIVE_SESSION}
+      responses:
+        204:
+          description: CORS preflight response
+    post:
+      summary: Voice live session lease open/heartbeat/close
+      operationId: voiceLiveSessionPost
+      x-google-backend:
+        address: ${VOICE_LIVE_SESSION}
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            type: object
+            properties:
+              action:
+                type: string
+              session_id:
+                type: string
+              course_id:
+                type: string
+              presentation_id:
+                type: string
+              slide_id:
+                type: string
+      responses:
+        200:
+          description: Successful response
+securityDefinitions:
+  api_key:
+    type: apiKey
+    name: key
+    in: query

@@ -1,0 +1,1011 @@
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+import glob
+import hashlib
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.cloud import storage, firestore, texttospeech
+
+# Add backend root to sys.path to allow imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Add functions/config to sys.path to allow importing logic modules
+functions_config_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "functions",
+    "config"
+)
+sys.path.append(functions_config_path)
+
+# Import admin tool for creating the course
+from admin_tools.manage_courses import create_or_update_course
+
+# --- SETUP ENV VARS BEFORE IMPORTS ---
+# This is critical for google.genai / vertexai initialization in message_generator
+
+def _normalize_outputs(data):
+    if not isinstance(data, dict):
+        return {}
+    if "cdktf" in data and isinstance(data["cdktf"], dict):
+        return data["cdktf"]
+    for value in data.values():
+        if isinstance(value, dict) and "project-id" in value:
+            return value
+    return data
+
+
+def _preload_env_vars():
+    """Pre-loads project config to set env vars before modules initialize."""
+    # Try to find cdktf_outputs.json
+    output_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "cdktf_outputs.json"
+    )
+    
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-east1")
+    
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, 'r') as f:
+                data = json.load(f)
+                outputs = _normalize_outputs(data)
+                project_id = outputs.get("project-id", project_id)
+        except Exception:
+            pass
+
+    if project_id:
+        os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+        os.environ["GOOGLE_CLOUD_LOCATION"] = location
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+        print(f"✅ Pre-set Env: PROJECT={project_id}, LOCATION={location}, VERTEXAI=true")
+    else:
+        print("⚠️  Warning: GOOGLE_CLOUD_PROJECT not found. GenAI might fail.")
+
+_preload_env_vars()
+
+# Import logic modules from functions/config
+try:
+    import message_generator
+    import course_utils
+    import firestore_utils
+    import utils
+except ImportError as e:
+    logging.error(f"Failed to import function modules: {e}", exc_info=True)
+    sys.exit(1)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# --- HELPERS ---
+
+def load_cdktf_outputs():
+    """
+    Loads backend/cdktf_outputs.json to get infrastructure details.
+    """
+    output_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "cdktf_outputs.json"
+    )
+    
+    if not os.path.exists(output_path):
+        return {}
+        
+    try:
+        with open(output_path, 'r') as f:
+            data = json.load(f)
+            return _normalize_outputs(data)
+    except Exception as e:
+        logger.warning(f"Failed to read cdktf_outputs.json: {e}")
+        return {}
+
+def upload_to_bucket(bucket_name, source_file_path, destination_blob_name):
+    """
+    Uploads a file to the bucket and returns the public URL.
+    Skips upload if file already exists.
+    """
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+
+        if blob.exists():
+            url = blob.public_url
+            logger.info(f"✅ Image already exists: {destination_blob_name}, skipping upload")
+            return url
+        
+        blob.upload_from_filename(source_file_path)
+        url = blob.public_url
+        logger.info(f"✅ Uploaded {source_file_path} to {destination_blob_name}")
+        return url
+    except Exception as e:
+        logger.error(f"❌ Failed to upload {source_file_path} to bucket: {e}")
+        return None
+
+
+def upload_json_to_bucket(bucket_name, destination_blob_name, payload):
+    """Upload JSON payload to bucket and return public URL."""
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+        blob.upload_from_string(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            content_type="application/json"
+        )
+        return blob.public_url
+    except Exception as e:
+        logger.error(f"❌ Failed to upload JSON to bucket ({destination_blob_name}): {e}")
+        return None
+
+
+def normalize_presentation_id(ppt_filename):
+    safe_ppt_id = ppt_filename
+    try:
+        _ppt_norm = os.path.splitext(ppt_filename.lower())[0]
+        for _s in ("_with_visuals", "_with_notes", "_visuals", "_en", "_zh-cn", "_yue-hk"):
+            if _ppt_norm.endswith(_s):
+                _ppt_norm = _ppt_norm[: -len(_s)]
+        safe_ppt_id = _ppt_norm.replace('/', '_').replace('\\', '_').replace(' ', '_')
+    except Exception:
+        safe_ppt_id = ppt_filename.replace('/', '_').replace('\\', '_').replace(' ', '_')
+    return safe_ppt_id
+
+
+def sort_slide_entries(slides):
+    def _key(item):
+        sid = str(item.get("slide_id", ""))
+        try:
+            return (0, int(sid))
+        except ValueError:
+            return (1, sid)
+    return sorted(slides, key=_key)
+
+
+def _manifest_content_hash(manifest_payload):
+    canonical = json.dumps(manifest_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _db_name():
+    return (os.environ.get("FIRESTORE_DATABASE") or "langbridge").strip() or "langbridge"
+
+
+def upsert_course_package_registry(*, backend_project_id, course_id, bucket_name, package_prefix, manifest_url, package_version, manifest_payload):
+    package_hash = _manifest_content_hash(manifest_payload)
+    package_id = str(manifest_payload.get("package_id") or "").strip() or f"pkg_{package_hash[:16]}"
+    db = firestore.Client(project=backend_project_id, database=_db_name())
+    db.collection("course_packages").document(package_id).set(
+        {
+            "package_id": package_id,
+            "course_id": course_id,
+            "package_bucket": bucket_name,
+            "package_prefix": package_prefix,
+            "manifest_path": "",
+            "manifest_url": manifest_url,
+            "package_version": package_version,
+            "status": "ready",
+            "content_hash": package_hash,
+            "source": "seed_script",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+    db.collection("courses").document(course_id).set(
+        {
+            "package_id": package_id,
+            "package_bucket": bucket_name,
+            "package_prefix": package_prefix,
+            "package_manifest_path": "",
+            "package_manifest_url": manifest_url,
+            "package_version": package_version,
+            "package_status": "ready",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+    return package_id
+
+
+def upsert_public_demo_class(*, backend_project_id, client_project_id, class_id, class_title, course_id, current_presentation_id, current_slide_id):
+    now = firestore.SERVER_TIMESTAMP
+    backend_db = firestore.Client(project=backend_project_id, database=_db_name())
+    backend_db.collection("classes").document(class_id).set(
+        {
+            "class_id": class_id,
+            "title": class_title,
+            "course_id": course_id,
+            "source_presentation_course_id": course_id,
+            "teacher_uid": "seed",
+            "teacher_email": "seed@system.local",
+            "is_public": True,
+            "active": True,
+            "current_presentation_id": current_presentation_id,
+            "current_slide_id": current_slide_id,
+            "updated_at": now,
+            "created_at": now,
+        },
+        merge=True,
+    )
+    if client_project_id:
+        client_db = firestore.Client(project=client_project_id, database="(default)")
+        client_db.collection("classes").document(class_id).set(
+            {
+                "class_id": class_id,
+                "title": class_title,
+                "course_id": course_id,
+                "teacher_uid": "seed",
+                "is_public": True,
+                "active": True,
+                "updated_at": now,
+            },
+            merge=True,
+        )
+
+
+def load_notes_for_language(json_path, lang_code):
+    """
+    Loads slide assets from a language-specific progress JSON file.
+    Returns a dict: {slide_number_str: {"text": note_text, "audio_file_path": "..."}}
+    """
+    if not os.path.exists(json_path):
+        return {}
+        
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        slides_dict = data.get("slides", {})
+        notes_map = {}
+        
+        for slide in slides_dict.values():
+            # Priority: original_notes (often English source) -> note (generated translation)
+            # For non-English files, 'note' usually contains the translated text.
+            note = slide.get("note", "")
+            
+            idx = str(slide.get("slide_index"))
+            if note:
+                notes_map[idx] = {
+                    "text": note,
+                    "audio_file_path": slide.get("audio_file_path")
+                }
+                
+        return notes_map
+    except Exception as e:
+        logger.error(f"Failed to load notes from {json_path}: {e}")
+        return {}
+
+
+def resolve_local_audio_path(raw_audio_path, generate_dir, base_name, lang_suffix):
+    """Resolve audio file path from progress JSON to a local file if available."""
+    if not raw_audio_path:
+        return None
+
+    candidates = []
+
+    # Keep original path first.
+    candidates.append(raw_audio_path)
+
+    # Relative paths are interpreted from generate_dir.
+    if not os.path.isabs(raw_audio_path):
+        candidates.append(os.path.join(generate_dir, raw_audio_path))
+
+    filename = os.path.basename(raw_audio_path)
+    source_dir_name = os.path.basename(os.path.dirname(raw_audio_path))
+
+    if filename:
+        candidates.extend([
+            os.path.join(generate_dir, f"{base_name}_{lang_suffix}_speech", filename),
+            os.path.join(generate_dir, f"{base_name}_speech", filename),
+            os.path.join(generate_dir, filename),
+        ])
+        if source_dir_name:
+            candidates.append(os.path.join(generate_dir, source_dir_name, filename))
+
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+
+    return None
+
+
+def sha256_file(file_path):
+    """Compute SHA256 for a file."""
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def load_slides_structure(json_path):
+    """
+    Parses the 'en' progress JSON to establish the slide order and structure.
+    Returns a list of dicts with 'slide_number' and 'original_context' (English).
+    """
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        slides_dict = data.get("slides", {})
+        sorted_slides = sorted(slides_dict.values(), key=lambda x: x.get("slide_index", 0))
+        
+        slides_data = []
+        for slide in sorted_slides:
+            note = slide.get("note", "") or slide.get("original_notes", "")
+            slides_data.append({
+                "slide_number": str(slide.get("slide_index")),
+                "context": note 
+            })
+            
+        return slides_data
+    except Exception as e:
+        logger.error(f"Failed to load structure from {json_path}: {e}")
+        return []
+
+# --- LOGIC MIGRATION ---
+
+def process_slide_locally(
+    slide_number, 
+    context, 
+    ppt_filename, 
+    course_id, 
+    languages, 
+    bucket_name, 
+    backend_project_id, 
+    client_project_id, 
+    visual_links,
+    pre_generated_messages=None
+):
+    """
+    Replicates logic to generate/broadcast. 
+    Now accepts `pre_generated_messages` entries as either:
+    - { 'zh-CN': '...', 'yue-HK': '...' }
+    - { 'zh-CN': {'text': '...', 'audio_file_path': '...'} }
+    """
+    logger.info(f"--- Processing Slide {slide_number} ---")
+    pre_generated_messages = pre_generated_messages or {}
+    
+    os.environ["GOOGLE_CLOUD_PROJECT"] = backend_project_id
+
+    # Log the event 
+    _preview = context[:50] + ("..." if len(context) > 50 else "")
+    course_utils.log_presentation_event(course_id, {
+        "type": "slide_change",
+        "context_snippet": _preview,
+        "languages": languages,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
+
+    # Prepare broadcast payload
+    broadcast_payload = {
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "languages": {},
+        "original_context": context,
+        "course_id": course_id,
+        "supported_languages": languages,
+        "page_number": slide_number
+    }
+
+    # Store original ppt filename for reference
+    if ppt_filename:
+        broadcast_payload["ppt_filename"] = ppt_filename
+    
+    # Compute context hash
+    try:
+        _norm_ctx = utils.normalize_context(context)
+        _ctx_hash = hashlib.sha256(_norm_ctx.encode("utf-8")).hexdigest()[:12]
+        broadcast_payload["context_hash"] = _ctx_hash
+    except Exception:
+        pass
+
+    # Step 1: Generate/Retrieve Messages
+    logger.info("Preparing messages for %d languages...", len(languages))
+    message_results = {}
+
+    def generate_for_language(lang):
+        # OPTIMIZATION: Check if we already have the text
+        if lang in pre_generated_messages:
+            pre_gen_entry = pre_generated_messages[lang]
+            local_audio_file = None
+            if isinstance(pre_gen_entry, dict):
+                existing_text = pre_gen_entry.get("text", "")
+                local_audio_file = pre_gen_entry.get("audio_file_path")
+            else:
+                existing_text = pre_gen_entry
+            if existing_text:
+                logger.info(f"[{lang}] ✅ Found pre-generated text.")
+                return (lang, existing_text, None, local_audio_file, None)
+        
+        # Fallback to Agent Generation
+        logger.info(f"[{lang}] ⚠️  No pre-generated text found. Calling Agent...")
+        try:
+            result = message_generator.generate_presentation_message(lang, context, course_id=course_id)
+            if isinstance(result, tuple):
+                generated, audio_url = result
+            else:
+                generated = result
+                audio_url = None
+            
+            if generated:
+                return (lang, generated, audio_url, None, None)
+            else:
+                return (lang, None, None, None, "Generation failed")
+        except Exception as e:
+            return (lang, None, None, None, str(e))
+
+    with ThreadPoolExecutor(max_workers=min(len(languages), 5)) as executor:
+        future_to_lang = {executor.submit(generate_for_language, lang): lang for lang in languages}
+        for future in as_completed(future_to_lang):
+            lang, generated, audio_url, local_audio_file, error = future.result()
+            if generated:
+                message_results[lang] = {
+                    "text": generated,
+                    "audio_url": audio_url,
+                    "local_audio_file": local_audio_file
+                }
+                # logger.info(f"[{lang}] Text ready.")
+            elif error:
+                logger.warning(f"[{lang}] Failed: {error}")
+
+    # Step 2: Generate MP3s
+    if not bucket_name:
+        logger.warning("SPEECH_FILE_BUCKET not provided - skipping audio.")
+        for lang, data in message_results.items():
+             broadcast_payload["languages"][lang] = {"text": data["text"]}
+             if lang in visual_links:
+                 broadcast_payload["languages"][lang]["slide_link"] = visual_links[lang]
+    else:
+        logger.info("Generating/checking MP3s...")
+        
+        def generate_mp3_for_language(lang, data):
+            generated = data["text"]
+            cached_audio_url = data.get("audio_url")
+            local_audio_file = data.get("local_audio_file")
+            
+            if cached_audio_url:
+                logger.info(f"[{lang}] Using cached audio: {cached_audio_url}")
+                return (lang, {"text": generated, "audio_url": cached_audio_url}, None)
+            
+            lang_data = {"text": generated}
+            try:
+                if local_audio_file:
+                    if not os.path.exists(local_audio_file):
+                        raise FileNotFoundError(
+                            f"Pre-generated audio file not found: {local_audio_file}"
+                        )
+                    content_hash = sha256_file(local_audio_file)[:12]
+                else:
+                    content_hash = hashlib.sha256(
+                        f"{generated}:{lang}".encode("utf-8")
+                    ).hexdigest()[:12]
+                filename = f"speech_{lang}_{content_hash}.mp3"
+                
+                storage_client = storage.Client(project=backend_project_id)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(filename)
+                
+                if blob.exists():
+                    logger.info(f"[{lang}] ✅ MP3 already exists: {filename}, skipping generation")
+                else:
+                    if local_audio_file:
+                        logger.info(f"[{lang}] Uploading pre-generated audio from {local_audio_file}")
+                        blob.upload_from_filename(local_audio_file, content_type="audio/mpeg")
+                    else:
+                        logger.info(f"[{lang}] Generating TTS...")
+                        tts_client = texttospeech.TextToSpeechClient()
+                        voice = course_utils.get_voice_params(course_id, lang)
+                        
+                        audio_config = texttospeech.AudioConfig(
+                            audio_encoding=texttospeech.AudioEncoding.MP3,
+                            speaking_rate=1.0
+                        )
+                        
+                        # Use retry logic for TTS synthesis
+                        tts_response = utils.synthesize_speech_with_retry(
+                            tts_client, generated, voice, audio_config
+                        )
+                        
+                        blob.upload_from_string(
+                            tts_response.audio_content,
+                            content_type="audio/mpeg"
+                        )
+                    logger.info(f"[{lang}] Uploaded {filename}")
+                
+                speech_url = f"https://storage.googleapis.com/{bucket_name}/{filename}"
+                lang_data["audio_url"] = speech_url
+                
+                return (lang, lang_data, None)
+                
+            except Exception as tts_e:
+                logger.error(f"[{lang}] TTS Failed: {tts_e}")
+                return (lang, lang_data, str(tts_e))
+
+        if message_results:
+            with ThreadPoolExecutor(max_workers=min(len(message_results), 5)) as executor:
+                future_to_lang = {
+                    executor.submit(generate_mp3_for_language, lang, data): lang 
+                    for lang, data in message_results.items()
+                }
+                for future in as_completed(future_to_lang):
+                    lang, lang_data, error = future.result()
+                    
+                    if lang in visual_links:
+                        lang_data["slide_link"] = visual_links[lang]
+                    
+                    broadcast_payload["languages"][lang] = lang_data
+        else:
+            logger.warning("No messages generated, skipping MP3 generation.")
+
+    # Step 3: Broadcast to Client Firestore
+    if broadcast_payload.get("languages") and client_project_id:
+        logger.info(f"Broadcasting to Client Project: {client_project_id}")
+        try:
+            broadcast_db = firestore.Client(
+                project=client_project_id,
+                database="(default)"
+            )
+            
+            doc_id = course_id if course_id else 'current'
+            broadcast_ref = broadcast_db.collection('presentation_broadcast').document(doc_id)
+            
+            ppt_fname = broadcast_payload.get('ppt_filename')
+
+            # Registry Update (Always happens for seeding)
+            if ppt_fname and slide_number is not None:
+                # Normalize filename to create safe document ID
+                try:
+                    _ppt_norm = os.path.splitext(ppt_fname.lower())[0]
+                    for _s in ("_with_visuals", "_with_notes", "_visuals", "_en", "_zh-cn", "_yue-hk"):
+                        if _ppt_norm.endswith(_s):
+                            _ppt_norm = _ppt_norm[: -len(_s)]
+                    # Replace slashes, backslashes, and spaces with underscores
+                    safe_ppt_id = _ppt_norm.replace('/', '_').replace('\\', '_').replace(' ', '_')
+                except Exception:
+                    safe_ppt_id = ppt_fname.replace('/', '_').replace('\\', '_').replace(' ', '_')
+
+                ppt_ref = broadcast_ref.collection('presentations').document(safe_ppt_id)
+                ppt_ref.set({"updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+
+                slide_ref = broadcast_ref.collection('presentations').document(safe_ppt_id).collection('slides').document(str(slide_number))
+                slide_ref.set(broadcast_payload, merge=True)
+                logger.info(f"Updated registry: {safe_ppt_id} / {slide_number}")
+
+            logger.info("✅ Registry population complete.")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to broadcast: {e}")
+    else:
+        logger.warning("Skipping broadcast (no languages or no client_project_id)")
+
+
+# --- DEFAULT DATA ---
+
+DEFAULT_COURSE_ID = "showcase"
+DEFAULT_COURSE_TITLE = "Showcase"
+DEFAULT_LANGUAGES = ["en-US", "zh-CN", "yue-HK"]
+
+# Mapping for visual folder suffixes
+LANG_VISUAL_SUFFIX_MAP = {
+    "en-US": "en",
+    "zh-CN": "zh-CN",
+    "yue-HK": "yue-HK"
+}
+
+# Mapping for progress files (source text)
+# Looks for {basename}_{suffix}_progress.json
+LANG_PROGRESS_SUFFIX_MAP = {
+    "en-US": "en",
+    "zh-CN": "zh-CN",
+    "yue-HK": "yue-HK"
+}
+
+
+
+# Import shared constants
+from admin_tools.constants import AVAILABLE_STYLES, DEFAULT_VOICE_CONFIGS
+
+# -----------------
+
+def ensure_course_exists(course_id, course_title, languages):
+    """Creates or updates the course in Firestore using admin tools."""
+    logger.info(f"Ensuring course exists: {course_id} ({course_title})...")
+    
+    # Construct voice configs
+    voice_configs = {}
+    for lang in languages:
+        if lang in DEFAULT_VOICE_CONFIGS:
+            voice_configs[lang] = DEFAULT_VOICE_CONFIGS[lang]
+        else:
+            logger.warning(f"No default voice config for {lang}, using en-US default as placeholder")
+            voice_configs[lang] = {"name": "en-US-Neural2-F", "gender": "FEMALE"}
+
+    # Detect style from course ID
+    style = 'professional'  # Default to professional
+    for available_style in AVAILABLE_STYLES:
+        if available_style != 'professional' and course_id.endswith(f'-{available_style}'):
+            style = available_style
+            break
+
+    try:
+        create_or_update_course(
+            course_id, 
+            course_title, 
+            languages, 
+            voice_configs,
+            style
+        )
+        logger.info("✅ Course created/updated successfully.")
+    except Exception as e:
+        logger.error(f"❌ Failed to create course: {e}")
+        sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(description="Seed Class Content and Generate Content Locally")
+    parser.add_argument("--skip-create", action="store_true", help="Skip creating the course")
+    parser.add_argument("--course-id", default=DEFAULT_COURSE_ID, help=f"Course ID (default: {DEFAULT_COURSE_ID})")
+    parser.add_argument("--course-title", default=DEFAULT_COURSE_TITLE, help=f"Course Title (default: {DEFAULT_COURSE_TITLE})")
+    parser.add_argument("--data-dir", default="generate", help="Directory containing generated content (relative to script or absolute)")
+    parser.add_argument("--languages", nargs="+", default=DEFAULT_LANGUAGES, help=f"List of languages (default: {' '.join(DEFAULT_LANGUAGES)})")
+    parser.add_argument("--max-workers", type=int, default=10, help="Maximum number of parallel slide processing workers (default: 10)")
+    parser.add_argument("--package-prefix", default="", help="Package root prefix in bucket (default: course-packages/<course_id>)")
+    parser.add_argument("--package-version", default="", help="Package version folder (default: seed-<UTC timestamp>)")
+    parser.add_argument("--skip-manifest", action="store_true", help="Skip emitting package manifest")
+    parser.add_argument("--skip-public-demo-class", action="store_true", help="Skip creating/updating public demo class for this seeded course")
+    
+    args = parser.parse_args()
+    
+    # Load infra config
+    outputs = load_cdktf_outputs()
+    cdktf_outputs = outputs.get("cdktf", outputs)
+    
+    # Extract IDs
+    backend_project_id = cdktf_outputs.get("project-id")
+    client_project_id = cdktf_outputs.get("client-project-id")
+    bucket_name = cdktf_outputs.get("speech-file-bucket")
+    
+    if not backend_project_id or not client_project_id:
+        logger.error("❌ Project IDs not found in cdktf_outputs.json")
+        sys.exit(1)
+
+    logger.info(f"Backend Project: {backend_project_id}")
+    logger.info(f"Client Project: {client_project_id}")
+    logger.info(f"Bucket: {bucket_name}")
+    logger.info(f"Course ID: {args.course_id}")
+
+    # Ensure we use backend project for initial setup
+    os.environ["GOOGLE_CLOUD_PROJECT"] = backend_project_id
+
+    if not args.skip_create:
+        ensure_course_exists(args.course_id, args.course_title, args.languages)
+    else:
+        logger.info("Skipping course creation.")
+        
+    # Resolve generate directory
+    if os.path.isabs(args.data_dir):
+        generate_dir = args.data_dir
+    else:
+        seeds_dir = os.path.dirname(os.path.abspath(__file__))
+        generate_dir = os.path.join(seeds_dir, args.data_dir)
+    
+    if not os.path.exists(generate_dir):
+        logger.error(f"❌ Data directory not found: {generate_dir}")
+        sys.exit(1)
+    
+    # Find all base 'en' progress files to drive the loop
+    progress_files = glob.glob(os.path.join(generate_dir, "*_en_progress.json"))
+    progress_files.sort()
+    
+    if not progress_files:
+        logger.warning(f"No *_en_progress.json files found in {generate_dir}")
+        return
+
+    for original_json_path in progress_files:
+        # Determine Base Name (always from the original standard file)
+        filename = os.path.basename(original_json_path)
+        base_name = filename.replace("_en_progress.json", "")
+
+        # Check for refined version
+        refined_path = original_json_path.replace("_en_progress.json", "_en_progress_refined.json")
+        if os.path.exists(refined_path):
+            logger.info(f"Found base progress file: {original_json_path}")
+            logger.info(f"✅ Found refined progress file: {refined_path}. Using it instead.")
+            json_path = refined_path
+        else:
+            logger.info(f"Found base progress file: {original_json_path}")
+            json_path = original_json_path
+        
+        # Find matching PPT
+        ppt_candidates = [
+            f"{base_name}_with_visuals.pptm",
+            f"{base_name}_with_visuals.pptx",
+            f"{base_name}_en_with_visuals.pptm"
+        ]
+        
+        ppt_path = None
+        for cand in ppt_candidates:
+            cand_path = os.path.join(generate_dir, cand)
+            if os.path.exists(cand_path):
+                ppt_path = cand_path
+                break
+        
+        if not ppt_path:
+            logger.warning(f"Could not find matching PPT file for {json_path}")
+            # Fallback to filename if file not found locally, just for ID
+            ppt_filename = f"{base_name}_with_visuals.pptm"
+        else:
+            ppt_filename = os.path.basename(ppt_path)
+            
+        ppt_basename = os.path.splitext(ppt_filename)[0]
+        safe_ppt_id = normalize_presentation_id(ppt_filename)
+        package_root_prefix = (args.package_prefix or f"course-packages/{args.course_id}").strip("/ ")
+        package_version = (args.package_version or f"seed-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}").strip("/ ")
+        package_presentation_prefix = f"{package_root_prefix}/{package_version}/{safe_ppt_id}"
+        presentation_manifest = {
+            "presentation_id": safe_ppt_id,
+            "source_ppt_filename": ppt_filename,
+            "slides": []
+        }
+        
+        # Load Structure (from EN)
+        slides_structure = load_slides_structure(json_path)
+        if not slides_structure:
+            continue
+
+        # Pre-load all language notes
+        # Map: { slide_index_str: { 'en-US': '...', 'zh-CN': '...' } } 
+        slide_notes_map = {} 
+        
+        for lang in args.languages:
+            # Fallback to language code if suffix map doesn't have it
+            suffix = LANG_PROGRESS_SUFFIX_MAP.get(lang, lang)
+            if suffix:
+                # Try to find specific progress file for this language
+                original_lang_path = os.path.join(generate_dir, f"{base_name}_{suffix}_progress.json")
+                refined_lang_path = os.path.join(generate_dir, f"{base_name}_{suffix}_progress_refined.json")
+                
+                lang_prog_file = None
+                if os.path.exists(refined_lang_path):
+                    logger.info(f"✅ Found refined progress file for {lang}: {os.path.basename(refined_lang_path)}")
+                    lang_prog_file = refined_lang_path
+                elif os.path.exists(original_lang_path):
+                    logger.info(f"Loading pre-generated text for {lang} from {os.path.basename(original_lang_path)}")
+                    lang_prog_file = original_lang_path
+                
+                if lang_prog_file:
+                    notes = load_notes_for_language(lang_prog_file, lang)
+                    for idx, assets in notes.items():
+                        if idx not in slide_notes_map:
+                            slide_notes_map[idx] = {}
+                        text = assets.get("text", "")
+                        raw_audio_path = assets.get("audio_file_path")
+                        resolved_audio_path = resolve_local_audio_path(
+                            raw_audio_path,
+                            generate_dir,
+                            base_name,
+                            suffix
+                        )
+                        if raw_audio_path and not resolved_audio_path:
+                            logger.warning(
+                                f"[{lang}] Could not resolve local audio path for slide {idx}: {raw_audio_path}"
+                            )
+                        slide_notes_map[idx][lang] = {
+                            "text": text,
+                            "audio_file_path": resolved_audio_path
+                        }
+                else:
+                    logger.info(f"No progress file found for {lang} ({original_lang_path})")
+
+        # Process slides in parallel for speed
+        logger.info(f"Processing {len(slides_structure)} slides in parallel...")
+        
+        def process_single_slide(slide):
+            """Wrapper function for parallel slide processing"""
+            slide_num = slide["slide_number"]
+            context = slide["context"]
+            
+            # Get pre-generated messages for this slide
+            pre_gen = slide_notes_map.get(slide_num, {})
+            
+            # Prepare visual links (parallel upload)
+            visual_links = {}
+            manifest_languages = {}
+            if bucket_name:
+                base_search_name = base_name
+                image_filename = f"slide_{slide_num}_reimagined.png"
+                
+                def upload_visual_for_language(lang_code):
+                    suffix = LANG_VISUAL_SUFFIX_MAP.get(lang_code, lang_code)
+                    visuals_dir_candidates = [
+                        os.path.join(generate_dir, f"{base_search_name}_{suffix}_visuals"),
+                        os.path.join(generate_dir, f"{base_search_name}_visuals"),
+                        os.path.join(generate_dir, f"{base_search_name}_en_visuals"), 
+                    ]
+                    
+                    found_image = None
+                    for v_dir in visuals_dir_candidates:
+                        cand_p = os.path.join(v_dir, image_filename)
+                        if os.path.exists(cand_p):
+                            found_image = cand_p
+                            break
+                    
+                    if found_image:
+                        blob_name = f"generated_visuals/{args.course_id}/{base_search_name}/{lang_code}/{image_filename}"
+                        url = upload_to_bucket(bucket_name, found_image, blob_name)
+                        return (lang_code, url)
+                    return (lang_code, None)
+                
+                with ThreadPoolExecutor(max_workers=min(len(args.languages), 5)) as executor:
+                    futures = {executor.submit(upload_visual_for_language, lang): lang for lang in args.languages}
+                    for future in as_completed(futures):
+                        lang_code, url = future.result()
+                        if url:
+                            visual_links[lang_code] = url
+
+            for lang_code in args.languages:
+                lang_assets = pre_gen.get(lang_code, {}) if isinstance(pre_gen.get(lang_code, {}), dict) else {}
+                text_value = str(lang_assets.get("text") or context or "").strip()
+                lang_manifest = {"text": text_value}
+
+                local_audio_file = lang_assets.get("audio_file_path")
+                if bucket_name and local_audio_file and os.path.exists(local_audio_file):
+                    audio_filename = os.path.basename(local_audio_file)
+                    audio_object_path = f"{package_presentation_prefix}/audio/{lang_code}/{audio_filename}"
+                    audio_url = upload_to_bucket(bucket_name, local_audio_file, audio_object_path)
+                    if audio_url:
+                        lang_manifest["audio_url"] = audio_url
+
+                image_filename = f"slide_{slide_num}_reimagined.png"
+                suffix = LANG_VISUAL_SUFFIX_MAP.get(lang_code, lang_code)
+                visuals_dir_candidates = [
+                    os.path.join(generate_dir, f"{base_name}_{suffix}_visuals"),
+                    os.path.join(generate_dir, f"{base_name}_visuals"),
+                    os.path.join(generate_dir, f"{base_name}_en_visuals"),
+                ]
+                found_image = None
+                for v_dir in visuals_dir_candidates:
+                    cand_p = os.path.join(v_dir, image_filename)
+                    if os.path.exists(cand_p):
+                        found_image = cand_p
+                        break
+                if bucket_name and found_image:
+                    image_object_path = f"{package_presentation_prefix}/assets/{lang_code}/{image_filename}"
+                    image_url = upload_to_bucket(bucket_name, found_image, image_object_path)
+                    if image_url:
+                        lang_manifest["image_url"] = image_url
+
+                manifest_languages[lang_code] = lang_manifest
+
+            # Call logic locally
+            process_slide_locally(
+                slide_number=slide_num,
+                context=context,
+                ppt_filename=ppt_filename,
+                course_id=args.course_id,
+                languages=args.languages,
+                bucket_name=bucket_name,
+                backend_project_id=backend_project_id,
+                client_project_id=client_project_id,
+                visual_links=visual_links,
+                pre_generated_messages=pre_gen
+            )
+            return {
+                "slide_id": str(slide_num),
+                "languages": manifest_languages
+            }
+        
+        # Process all slides in parallel
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            futures = {executor.submit(process_single_slide, slide): slide for slide in slides_structure}
+            for future in as_completed(futures):
+                try:
+                    slide_result = future.result()
+                    presentation_manifest["slides"].append(slide_result)
+                    logger.info(f"✅ Completed slide {slide_result['slide_id']}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to process slide: {e}", exc_info=True)
+
+        if not args.skip_manifest:
+            presentation_manifest["slides"] = sort_slide_entries(presentation_manifest["slides"])
+            manifest_payload = {
+                "schema_version": "1.0",
+                "course_id": args.course_id,
+                "package_version": package_version,
+                "package_prefix": package_presentation_prefix,
+                "presentations": [presentation_manifest],
+            }
+            local_manifest_path = os.path.join(generate_dir, f"{safe_ppt_id}_manifest.json")
+            with open(local_manifest_path, "w", encoding="utf-8") as manifest_file:
+                json.dump(manifest_payload, manifest_file, ensure_ascii=False, indent=2)
+            logger.info(f"✅ Wrote local manifest: {local_manifest_path}")
+
+            if bucket_name:
+                manifest_object_path = f"{package_presentation_prefix}/manifest.json"
+                manifest_url = upload_json_to_bucket(bucket_name, manifest_object_path, manifest_payload)
+                if manifest_url:
+                    logger.info(f"✅ Uploaded package manifest: gs://{bucket_name}/{manifest_object_path}")
+                    try:
+                        package_id = upsert_course_package_registry(
+                            backend_project_id=backend_project_id,
+                            course_id=args.course_id,
+                            bucket_name=bucket_name,
+                            package_prefix=package_presentation_prefix,
+                            manifest_url=manifest_url,
+                            package_version=package_version,
+                            manifest_payload=manifest_payload,
+                        )
+                        logger.info(f"✅ Linked course package: {package_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to link course package in Firestore: {e}")
+                        sys.exit(1)
+                else:
+                    logger.error("❌ Failed to upload package manifest")
+                    sys.exit(1)
+
+    # Final Step: Set Live Pointer to the first slide of the last processed presentation
+    # to ensure the client app shows something immediately.
+    if client_project_id and ppt_filename:
+        logger.info(f"Setting live pointer to {ppt_filename} ...")
+        try:
+            broadcast_db = firestore.Client(
+                project=client_project_id,
+                database="(default)"
+            )
+            doc_id = args.course_id
+            broadcast_ref = broadcast_db.collection('presentation_broadcast').document(doc_id)
+            
+            # Normalize for ID (Consistency with process_slide_locally)
+            safe_ppt_id = normalize_presentation_id(ppt_filename)
+
+            # Find first slide number
+            first_slide = "0"
+            if 'slides_structure' in locals() and slides_structure:
+                first_slide = str(slides_structure[0]["slide_number"])
+
+            logger.info(f"Targeting Slide {first_slide} of {safe_ppt_id}")
+
+            # Fetch 'latest_languages' from the registry we just populated
+            # so the live view has data immediately
+            slide_ref = broadcast_ref.collection('presentations').document(safe_ppt_id).collection('slides').document(first_slide)
+            slide_snap = slide_ref.get() 
+            
+            latest_languages = {}
+            if slide_snap.exists:
+                latest_languages = slide_snap.get("languages") or {}
+
+            broadcast_ref.set({
+                "current_presentation_id": safe_ppt_id,
+                "current_slide_id": first_slide,
+                "latest_languages": latest_languages,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+            logger.info("✅ Live pointer set.")
+            if not args.skip_public_demo_class:
+                try:
+                    upsert_public_demo_class(
+                        backend_project_id=backend_project_id,
+                        client_project_id=client_project_id,
+                        class_id=args.course_id,
+                        class_title=f"{args.course_title} Demo",
+                        course_id=args.course_id,
+                        current_presentation_id=safe_ppt_id,
+                        current_slide_id=first_slide,
+                    )
+                    logger.info(f"✅ Public demo class ready: {args.course_id}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to upsert public demo class: {e}")
+                    sys.exit(1)
+            
+        except Exception as e:
+            logger.error(f"Failed to set live pointer: {e}")
+
+if __name__ == "__main__":
+    main()

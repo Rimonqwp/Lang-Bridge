@@ -1,0 +1,144 @@
+import logging
+import os
+import hashlib
+from google.cloud import firestore
+
+logger = logging.getLogger(__name__)
+
+
+def _get_db():
+    """Return a Firestore client using an optional env database name.
+
+    If `FIRESTORE_DATABASE` is set, use that database; otherwise use the
+    'langbridge' database.
+    """
+    db_name = os.environ.get("FIRESTORE_DATABASE", "langbridge").strip()
+    if db_name:
+        return firestore.Client(database=db_name)
+    return firestore.Client(database="langbridge")
+
+
+def _get_client_db():
+    """Return a Firestore client for the client project."""
+    client_project_id = os.environ.get("CLIENT_FIRESTORE_PROJECT_ID", "ai-presenter-client")
+    client_database_id = os.environ.get("CLIENT_FIRESTORE_DATABASE_ID", "(default)")
+    return firestore.Client(project=client_project_id, database=client_database_id)
+
+
+
+
+
+def _normalize_context(context: str) -> str:
+    """Normalize context by trimming and collapsing whitespace."""
+    if not context:
+        return ""
+    # Collapse all whitespace runs to a single space and strip ends
+    return " ".join(str(context).split())
+
+
+def _cache_key(language_code: str, context: str) -> str:
+    """Build a stable, short cache key safe for Firestore doc IDs.
+
+    Uses lowercase language + 12-char SHA256 of normalized context.
+    Avoids very long document IDs and ensures consistent lookups.
+    """
+    lang = (language_code or "").strip().lower() or "unknown"
+    norm_ctx = _normalize_context(context)
+    if not norm_ctx:
+        logger.debug(
+            "Using default cache key: empty/whitespace-only context for %s",
+            lang,
+        )
+        return f"v1:{lang}:default"
+    digest = hashlib.sha256(norm_ctx.encode("utf-8")).hexdigest()[:12]
+    return f"v1:{lang}:{digest}"
+
+
+def get_cached_presentation_message(language_code: str, context: str = ""):
+    """Retrieve cached presentation message from Firestore.
+    
+    Returns tuple (message, audio_url) if found, (None, None) otherwise.
+    """
+    cache_key = _cache_key(language_code, context)
+    logger.debug("Looking up cache with key=%s", cache_key)
+    try:
+        db = _get_db()
+        cache_ref = db.collection(
+            'langbridge_presentation_cache'
+        ).document(cache_key)
+        cached_doc = cache_ref.get()
+        
+        if cached_doc.exists:
+            cached_data = cached_doc.to_dict()
+            if cached_data and "message" in cached_data:
+                logger.info(
+                    "✅ Cache hit for %s (key=%s)",
+                    language_code,
+                    cache_key
+                )
+                message = cached_data["message"]
+                audio_url = cached_data.get("audio_url")  # May be None
+                return (message, audio_url)
+            else:
+                logger.warning(
+                    "Cache doc exists but missing 'message' for key=%s",
+                    cache_key
+                )
+        else:
+            logger.info(
+                "Cache miss for key=%s (document does not exist)",
+                cache_key
+            )
+    except Exception as e:
+        logger.exception(
+            "Cache lookup failed for key=%s: %s",
+            cache_key,
+            e
+        )
+    return (None, None)
+
+
+def cache_presentation_message(
+    language_code: str, message: str, context: str = "", course_id: str = None, audio_url: str = None
+):
+    """Store generated presentation message in Firestore cache."""
+    if not message:
+        logger.warning(
+            "Refusing to cache empty message for %s",
+            language_code
+        )
+        return
+    
+    cache_key = _cache_key(language_code, context)
+    norm_ctx = _normalize_context(context)
+    logger.debug("Attempting to cache with key=%s", cache_key)
+    try:
+        db = _get_db()
+        cache_ref = db.collection(
+            'langbridge_presentation_cache'
+        ).document(cache_key)
+        
+        cache_data = {
+            "message": message,
+            "language_code": (language_code or "").strip().lower(),
+            "context": norm_ctx,
+            "context_hash": cache_key.rsplit(":", 1)[-1],
+            "updated_at": firestore.SERVER_TIMESTAMP
+        }
+        
+        if course_id:
+            cache_data["course_ids"] = firestore.ArrayUnion([course_id])
+        
+        if audio_url:
+            cache_data["audio_url"] = audio_url
+
+        logger.debug("Writing cache data: %s", cache_data)
+        # Use merge=True so we don't overwrite other fields or the array if it exists
+        cache_ref.set(cache_data, merge=True)
+        logger.info("✅ Successfully cached result for key=%s", cache_key)
+    except Exception as e:
+        logger.exception(
+            "❌ Failed to cache result for key=%s: %s",
+            cache_key,
+            e
+        )

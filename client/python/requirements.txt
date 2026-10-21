@@ -1,0 +1,15 @@
+pillow==12.2.0
+
+# OCR wrapper
+pytesseract==0.3.13
+
+# Screenshot/input utilities
+pyautogui==0.9.54
+
+# Multi-monitor capture helper
+mss==10.2.0
+
+# Audio Capture and Speech
+pyaudio==0.2.14
+google-cloud-speech==2.40.0
+requests==2.34.2

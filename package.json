@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "cdktn-cli": "^0.23.3"
+  }
+}
